@@ -84,9 +84,154 @@ IG_SESSIONID='<sessionid cookie value>' node server.js
 | `IG_SESSIONID` | *(unset)* | Instagram `sessionid` cookie value. Unlocks age-gated and audience-restricted reels — see [Login-gated reels](#login-gated-reels). Anonymous-only without it. |
 | `IG_COOKIE` | *(unset)* | Full `k=v; k=v` cookie string, if you'd rather paste that than a bare `sessionid`. Takes precedence over `IG_SESSIONID`. |
 
-## Deployment notes / caveats
+## Deploying
 
-- **Discord needs HTTPS** for `og:video` URLs. Put the service behind TLS (Caddy, nginx + certbot, Cloudflare, or a PaaS like Fly/Railway).
+The reference deployment is systemd + nginx + Let's Encrypt on a Debian/Ubuntu box, running the service as an unprivileged user behind a TLS reverse proxy. Substitute your own domain for `example.com` throughout.
+
+Discord will not render `og:video` over plain HTTP, so TLS is not optional.
+
+### 1. Service user and code
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin igreels
+sudo mkdir -p /opt/igreels-embedder
+sudo git clone https://github.com/Saulul/igreels_embedder.git /opt/igreels-embedder
+sudo chown -R igreels:igreels /opt/igreels-embedder
+```
+
+Node.js ≥ 18 is the only requirement — there are no dependencies to install.
+
+### 2. Secrets
+
+The session cookie goes in a root-only environment file, never in the unit itself:
+
+```sh
+sudo install -m 600 -o root -g root /dev/null /etc/igreels-embedder.env
+printf 'IG_SESSIONID=%s\n' 'PASTE_SESSIONID_HERE' | sudo tee -a /etc/igreels-embedder.env > /dev/null
+```
+
+Use `EnvironmentFile=`, not an `Environment=` line in the unit. Unit files are world-readable (`0644` on a stock Ubuntu box), and `systemctl show -p Environment` prints their values to any local user — including `nobody`. A value loaded from `EnvironmentFile=` shows up in neither, and the file itself is `0600` root-only. systemd reads it as root before dropping to the service user, so the unprivileged process still gets the value.
+
+Skip this step to run anonymous-only; see [Login-gated reels](#login-gated-reels).
+
+### 3. systemd unit
+
+`/etc/systemd/system/igreels-embedder.service`:
+
+```ini
+[Unit]
+Description=igreels-embedder (Instagram reel -> Discord embed service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=igreels
+Group=igreels
+WorkingDirectory=/opt/igreels-embedder
+Environment=NODE_ENV=production
+Environment=PORT=8080
+Environment=PUBLIC_BASE_URL=https://example.com
+EnvironmentFile=-/etc/igreels-embedder.env
+ExecStart=/usr/bin/node /opt/igreels-embedder/server.js
+Restart=on-failure
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The service never writes to disk, so `ProtectSystem=strict` with an empty `ReadWritePaths=` is safe. The leading `-` on `EnvironmentFile=` makes the file optional, so the service still starts if you haven't created it.
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now igreels-embedder
+```
+
+### 4. nginx
+
+`/etc/nginx/sites-available/igreels.conf`, symlinked into `sites-enabled/`:
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name example.com www.example.com;
+
+    # Stream video straight through instead of buffering whole MP4s to disk.
+    proxy_buffering off;
+    proxy_http_version 1.1;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+
+        proxy_read_timeout 60s;
+        client_max_body_size 1m;
+    }
+}
+```
+
+`proxy_buffering off` matters: without it nginx buffers each `/videos/*.mp4` response before forwarding, which delays playback and burns disk on large reels.
+
+```sh
+sudo ln -s /etc/nginx/sites-available/igreels.conf /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d example.com -d www.example.com
+```
+
+Certbot rewrites the block to listen on 443 and adds the HTTP→HTTPS redirect.
+
+### 5. Verify
+
+```sh
+curl -s https://example.com/healthz
+curl -s -A Discordbot https://example.com/reel/DaYHHJvqxWO/ | grep -o 'og:video[^>]*'
+curl -s -o /dev/null -D - -r 0-1023 https://example.com/videos/DaYHHJvqxWO.mp4 | head -1
+```
+
+Expect `ok (...)`, an `og:video` URL on your own domain, and `206 Partial Content` — Discord's media proxy relies on range requests. If you configured a session cookie, `/healthz` reports `session configured, not yet used` until the first gated reel is resolved, then `session ok`.
+
+Then paste a reel link into Discord with the domain swapped and confirm it plays inline.
+
+### Updating
+
+```sh
+cd /opt/igreels-embedder
+sudo -u igreels git pull
+node --check server.js && sudo systemctl restart igreels-embedder
+sudo systemctl is-active igreels-embedder && curl -s localhost:8080/healthz
+```
+
+`node --check` before restarting turns a bad pull into a failed command rather than a crash-looping service. To roll back, `git checkout` the previous commit and restart — there is no build step or migration.
+
+```sh
+journalctl -u igreels-embedder -f
+```
+
+## Caveats
+
 - **Datacenter IPs can get rate-limited or blocked by Instagram.** Residential/less-common hosting IPs work best. If you see `reel not found or query rejected` errors for reels that clearly exist, the server IP is likely being challenged. Routing just the GraphQL call through a proxy is the usual fix.
 - **`IG_DOC_ID` rotation.** Instagram retires query IDs every few months (old ones return "soft-deleted" errors). Get a fresh one by opening any reel on instagram.com with DevTools → Network → filter `graphql` → the `PolarisPostRootQuery` request's `doc_id` form field. Also confirm the `variables` shape hasn't changed.
 - **Login-gated reels need a session cookie.** Age-gated posts and audience-restricted accounts fail anonymously; set `IG_SESSIONID` to resolve them (see [Login-gated reels](#login-gated-reels)). Without it they fall back to a plain link preview. Reels from private accounts additionally require that the session account follows them.
