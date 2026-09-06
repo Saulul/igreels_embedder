@@ -215,20 +215,52 @@ Expect `ok (...)`, an `og:video` URL on your own domain, and `206 Partial Conten
 
 Then paste a reel link into Discord with the domain swapped and confirm it plays inline.
 
-### Updating
+### 6. Continuous deployment (GitHub Actions)
+
+Pushes to `main` deploy themselves. [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) syntax-checks the commit on a runner, then asks the server to move to it over SSH. The rollout itself is [`deploy/igreels-deploy.sh`](deploy/igreels-deploy.sh), installed on the box: it fetches, `git reset --hard`s to the pushed commit, runs `node --check`, restarts the unit, polls `/healthz` — and **rolls back to the previous commit if the service doesn't come back healthy**.
+
+The deploy key is pinned to a *forced command*, so it can run that one script and nothing else — no shell, no forwarding. A leaked key can redeploy the repo; it does not hand over the box.
+
+#### One-time server setup
 
 ```sh
-cd /opt/igreels-embedder
-sudo -u igreels git pull
-node --check server.js && sudo systemctl restart igreels-embedder
-sudo systemctl is-active igreels-embedder && curl -s localhost:8080/healthz
+# 1. Install the deploy hook.
+curl -fsSL https://raw.githubusercontent.com/Saulul/igreels_embedder/main/deploy/igreels-deploy.sh   | install -m 0755 /dev/stdin /usr/local/sbin/igreels-deploy
+
+# 2. Authorise the deploy key, locked to that one command.
+cat >> /root/.ssh/authorized_keys <<'KEY'
+command="/usr/local/sbin/igreels-deploy",restrict ssh-ed25519 AAAA...  github-actions-deploy
+KEY
 ```
 
-`node --check` before restarting turns a bad pull into a failed command rather than a crash-looping service. To roll back, `git checkout` the previous commit and restart — there is no build step or migration.
+`restrict` turns off pty allocation and agent/port/X11 forwarding; `command=` overrides whatever the client asks to run. The client's request survives only in `SSH_ORIGINAL_COMMAND`, which the script parses and validates as `deploy [<40-hex sha>]` before doing anything with it.
+
+The first deploy adopts `/opt/igreels-embedder` as a git checkout in place — `git init` + `remote add` + `reset --hard` — so a hand-copied tree converts without downtime. Untracked files (old `.bak`s) are left alone; `/etc/igreels-embedder.env` is never touched, so the session cookie survives every deploy.
+
+#### Repository secrets
+
+Settings → Secrets and variables → Actions:
+
+| Secret | Value |
+|---|---|
+| `DEPLOY_SSH_KEY` | the deploy key's **private** half — the whole file, `BEGIN`/`END` lines included |
+| `DEPLOY_HOST` | the server's IP or hostname |
+| `DEPLOY_KNOWN_HOSTS` | `ssh-keyscan -t ssh-ed25519 <host>` output — pins the host key so the job can't be MITM'd |
+
+Host and known-hosts are secrets rather than literals only to keep the server's address out of a public repo; neither is sensitive in itself.
+
+### Deploying by hand
+
+The hook is a normal script — run it as root on the server to force a rollout, or to pin a specific commit:
 
 ```sh
+igreels-deploy                       # tip of origin/main
+igreels-deploy 218589dfcc2e69094...  # a specific commit (full 40-char sha)
+systemctl is-active igreels-embedder && curl -s localhost:8080/healthz
 journalctl -u igreels-embedder -f
 ```
+
+Rolling back is just deploying the previous sha. There is no build step or migration.
 
 ## Caveats
 

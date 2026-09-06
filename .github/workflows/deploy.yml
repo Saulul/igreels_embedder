@@ -1,0 +1,52 @@
+name: Deploy
+
+# Every push to main rolls out to the VPS. The heavy lifting lives in
+# /usr/local/sbin/igreels-deploy on the server -- this job only proves the
+# commit parses and then asks the server to move to it.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never let two rollouts race; queue them instead of cancelling, so the
+# last push to land is the last one deployed.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'   # matches the VPS
+
+      # Cheap gate: a commit that doesn't even parse never reaches the box.
+      - name: Syntax-check server.js
+        run: node --check server.js
+
+      - name: Deploy
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY"     > ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+
+          # The key is pinned to a forced command on the server, so this
+          # string is parsed as a deploy request -- it is never a shell.
+          ssh -i ~/.ssh/deploy_key \
+              -o IdentitiesOnly=yes \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=yes \
+              -o ConnectTimeout=15 \
+              "root@${DEPLOY_HOST}" "deploy ${GIT_SHA}"
