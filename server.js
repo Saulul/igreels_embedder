@@ -530,8 +530,9 @@ function handleLanding(req, res) {
 <h1>saulinstagram</h1>
 <p>Make Instagram reels play directly inside Discord.</p>
 <p>Take any reel link and replace <code>instagram.com</code> with <code>${esc(base.replace(/^https?:\/\//, ''))}</code>:</p>
-<p><code>https://www.instagram.com/reel/DaYHHJvqxWO/</code><br />&darr;<br /><code>${esc(base)}/reel/DaYHHJvqxWO/</code></p>
+<p><code>https://instagram.com/reel/DaYHHJvqxWO/</code><br />&darr;<br /><code>${esc(base)}/reel/DaYHHJvqxWO/</code></p>
 <p>Paste the new link in Discord and the video embeds. Opening the link in a browser redirects you to the original reel on Instagram.</p>
+<p>Unlike other tools, this can display reels that are age-gated or from accounts that restrict their content to certain audiences.</p>
 </body></html>`;
   send(res, 200, { 'Content-Type': 'text/html; charset=utf-8' }, html);
 }
