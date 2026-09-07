@@ -145,6 +145,7 @@ let sessionSource = 'env';
 let rotations = 0;
 let lastRotationAt = null;
 let persistError = null;
+let persistOk = false;
 
 function readState() {
   if (!STATE_FILE) return null;
@@ -176,6 +177,7 @@ function writeState() {
     fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, STATE_FILE);
     persistError = null;
+    persistOk = true;
   } catch (err) {
     try {
       fs.unlinkSync(tmp);
@@ -196,21 +198,25 @@ function writeState() {
   if (!SEED.size) return;
 
   const state = readState();
-  if (!state || !state.cookies || !state.cookies.sessionid) return;
-
-  if (state.seedFingerprint !== SEED_FINGERPRINT) {
+  if (!state || !state.cookies || !state.cookies.sessionid) {
+    // Nothing stored yet: the seed stands as-is.
+  } else if (state.seedFingerprint !== SEED_FINGERPRINT) {
     console.log('[ig-auth] IG_SESSIONID differs from the stored session - the newly configured one wins');
-    writeState();
-    return;
+  } else {
+    for (const [k, v] of Object.entries(state.cookies)) if (JAR_KEYS.has(k)) jar.set(k, v);
+    rotations = Number(state.rotations) || 0;
+    lastRotationAt = Number(state.lastRotationAt) || null;
+    sessionSource = 'state-file';
+    console.log(
+      `[ig-auth] restored session from ${STATE_FILE} (${rotations} rotation${rotations === 1 ? '' : 's'} followed)`
+    );
   }
 
-  for (const [k, v] of Object.entries(state.cookies)) if (JAR_KEYS.has(k)) jar.set(k, v);
-  rotations = Number(state.rotations) || 0;
-  lastRotationAt = Number(state.lastRotationAt) || null;
-  sessionSource = 'state-file';
-  console.log(
-    `[ig-auth] restored session from ${STATE_FILE} (${rotations} rotation${rotations === 1 ? '' : 's'} followed)`
-  );
+  // Always write on the way out, whichever branch got us here. A rotation can
+  // be weeks away, and until one lands an unwritable state directory looks
+  // exactly like a working one -- so prove the write on every boot instead,
+  // where the failure lands in the deploy log while someone is watching.
+  writeState();
 })();
 
 const HAS_AUTH = jar.has('sessionid');
@@ -825,10 +831,14 @@ function sessionHealth() {
     cookies: [...jar.keys()],
     rotationsFollowed: rotations,
     lastRotationAgoSec: agoSec(lastRotationAt),
+    // "configured" is not "working": the path below is only reported as
+    // healthy once a write to it has actually succeeded.
     persistence: !STATE_FILE
       ? 'disabled (no STATE_DIRECTORY / IG_SESSION_STATE_FILE)'
       : persistError
       ? `failing: ${persistError}`
+      : !persistOk
+      ? `${STATE_FILE} (configured, not yet written)`
       : STATE_FILE,
     keepalive:
       KEEPALIVE_MS > 0
