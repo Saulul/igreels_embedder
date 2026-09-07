@@ -360,9 +360,13 @@ async function authedFetch(label, url, extraHeaders = {}) {
 
   const claim = res.headers.get('x-ig-set-www-claim');
   if (claim) wwwClaim = claim;
-  // Only from a response Instagram actually answered. A bounce to the login
-  // page carries cookie *clearings*, which are the opposite of a rotation.
-  if (res.ok) absorbSetCookie(res);
+  // A redirect to login, a 401 or a 403 are the responses that carry cookie
+  // *clearings* -- the opposite of a rotation -- so those are the only ones
+  // whose cookies get dropped. Everything else, a 400 included, is Instagram
+  // still talking to our session: "bad request" is not "bad session", and a
+  // rotation can ride any of them.
+  const rejected = (res.status >= 300 && res.status < 400) || res.status === 401 || res.status === 403;
+  if (!rejected) absorbSetCookie(res);
 
   // Redirected instead of answered: the session is no longer being honoured.
   if (res.status >= 300 && res.status < 400) {
@@ -403,16 +407,55 @@ function jitter(ms) {
   return Math.round(ms * (0.85 + Math.random() * 0.3));
 }
 
+// Which URL to ping is the one part of this that is genuinely Instagram's to
+// decide, and it moves. /api/v1/accounts/current_user/ is a *mobile* route and
+// answers 400 on www with a browser UA -- so rather than swap one guess for
+// another, try a short list and stick to whichever answers. Override with
+// IG_KEEPALIVE_URL (comma-separated) if none of these survive.
+const KEEPALIVE_URLS = (
+  process.env.IG_KEEPALIVE_URL ||
+  [
+    // What the web client fires behind Settings -> Edit profile. Auth-only:
+    // logged out it bounces to /accounts/login/.
+    'https://www.instagram.com/api/v1/accounts/edit/web_form_data/',
+    // Used by the web inbox on every page load; also auth-only.
+    'https://www.instagram.com/api/v1/direct_v2/has_interop_upgraded/',
+  ].join(',')
+)
+  .split(',')
+  .map((u) => u.trim())
+  .filter(Boolean);
+
+// Once one answers, keep using it instead of walking the list every hour.
+let keepaliveUrl = null;
+
 async function keepaliveOnce() {
-  try {
-    const data = await authedFetch('keepalive', 'https://www.instagram.com/api/v1/accounts/current_user/');
-    const username = data?.user?.username || '';
-    markAuthAlive();
-    lastKeepalive = { at: Date.now(), ok: true, detail: username ? `@${username}` : 'ok' };
-  } catch (err) {
-    lastKeepalive = { at: Date.now(), ok: false, detail: err.message };
-    console.warn(`[ig-auth] keepalive failed: ${err.message}`);
+  const candidates = keepaliveUrl ? [keepaliveUrl, ...KEEPALIVE_URLS.filter((u) => u !== keepaliveUrl)] : KEEPALIVE_URLS;
+
+  const failures = [];
+  for (const url of candidates) {
+    try {
+      const data = await authedFetch('keepalive', url);
+      const username = data?.user?.username || data?.form_data?.username || '';
+      markAuthAlive();
+      if (keepaliveUrl !== url) {
+        console.log(`[ig-auth] keepalive endpoint: ${url}`);
+        keepaliveUrl = url;
+      }
+      lastKeepalive = { at: Date.now(), ok: true, detail: username ? `@${username}` : 'ok', url };
+      return;
+    } catch (err) {
+      failures.push(`${new URL(url).pathname}: ${err.message}`);
+      // A rejected session fails the same way everywhere; walking the rest of
+      // the list would just be three ways of being told the cookie is dead.
+      if (!authState.ok) break;
+    }
   }
+
+  // Losing the sticky endpoint means the list is worth walking again next time.
+  keepaliveUrl = null;
+  lastKeepalive = { at: Date.now(), ok: false, detail: failures.join('; '), url: null };
+  console.warn(`[ig-auth] keepalive failed - ${failures.join('; ')}`);
 }
 
 function scheduleKeepalive(delay) {
@@ -846,6 +889,7 @@ function sessionHealth() {
             everySec: Math.round(KEEPALIVE_MS / 1000),
             lastAgoSec: lastKeepalive ? agoSec(lastKeepalive.at) : null,
             lastOk: lastKeepalive ? lastKeepalive.ok : null,
+            endpoint: keepaliveUrl,
             lastDetail: lastKeepalive ? lastKeepalive.detail : null,
             nextInSec: nextKeepaliveAt ? Math.max(0, Math.round((nextKeepaliveAt - Date.now()) / 1000)) : null,
           }
